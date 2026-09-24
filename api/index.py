@@ -62,94 +62,37 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: `/img cute cat in cyberpunk city, digital art`",
-            parse_mode="Markdown",
+            "⚠️ Vui lòng nhập mô tả: `/img con mèo không gian`"
         )
         return
 
     prompt = " ".join(context.args)
-
-    status_msg = await update.message.reply_text(
-        "🎨 Đang vẽ ảnh, vui lòng đợi..."
-    )
+    status_msg = await update.message.reply_text("🎨 Đang vẽ ảnh...")
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO
     )
 
-    # Sử dụng endpoint :generateContent với mô hình hỗ trợ sinh ảnh qua Developer API
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}"
-
-    headers = {"Content-Type": "application/json"}
-
-    # Payload chuẩn của :generateContent yêu cầu sinh ảnh
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": f"Generate a high quality visual image of: {prompt}"
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            res_data = response.json()
+        # Mã hoá prompt cho URL
+        encoded_prompt = urllib.parse.quote(prompt)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
 
-        if response.status_code != 200:
-            error_message = res_data.get("error", {}).get(
-                "message", response.text
-            )
-            await status_msg.edit_text(
-                f"❌ Lỗi từ Google ({response.status_code}):\n`{error_message[:250]}`"
-            )
-            return
-
-        # Tìm phần dữ liệu ảnh trong các candidates trả về
-        candidates = res_data.get("candidates", [])
-        image_bytes = None
-
-        if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            for part in parts:
-                inline_data = part.get("inlineData") or part.get("inline_data")
-                if inline_data and "data" in inline_data:
-                    image_bytes = base64.b64decode(inline_data["data"])
-                    break
-
-        if not image_bytes:
-            # Nếu model trả về text từ chối hoặc không sinh được ảnh
-            fallback_text = (
-                parts[0].get("text", "")
-                if candidates and parts
-                else "Không có dữ liệu ảnh trả về."
-            )
-            await status_msg.edit_text(
-                f"⚠️ Không nhận được ảnh. Phản hồi từ AI: {fallback_text[:200]}"
-            )
-            return
-
-        # Gửi ảnh về Telegram
-        photo_stream = io.BytesIO(image_bytes)
-        photo_stream.name = "output.jpg"
-
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=photo_stream,
-            caption=f"✨ **Prompt:** {prompt}",
-            parse_mode="Markdown",
-        )
-        await status_msg.delete()
-
-    except httpx.TimeoutException:
-        await status_msg.edit_text("⏳ Quá thời gian chờ (Timeout) khi tạo ảnh.")
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            res = await client.get(image_url)
+            if res.status_code == 200:
+                photo_stream = io.BytesIO(res.content)
+                photo_stream.name = "image.jpg"
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=photo_stream,
+                    caption=f"✨ **Prompt:** {prompt}",
+                    parse_mode="Markdown",
+                )
+                await status_msg.delete()
+            else:
+                await status_msg.edit_text("❌ Lỗi server vẽ ảnh.")
     except Exception as e:
-        logger.error(f"Lỗi tạo ảnh: {e}")
-        await status_msg.edit_text(f"❌ Đã xảy ra lỗi: `{str(e)[:200]}`")
+        await status_msg.edit_text(f"❌ Lỗi: {str(e)[:150]}")
 
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
