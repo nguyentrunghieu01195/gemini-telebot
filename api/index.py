@@ -3,6 +3,8 @@ import io
 import json
 import logging
 import os
+import base64
+import httpx
 from http.server import BaseHTTPRequestHandler
 from google import genai
 from telegram import Update
@@ -60,7 +62,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: `/img cute cat in space, 4k digital art`",
+            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: `/img cute cat in cyberpunk city, 4k`",
             parse_mode="Markdown",
         )
         return
@@ -74,25 +76,59 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO
     )
 
-    try:
-        # Gọi chính xác API của Imagen 3 dành cho Google AI Studio
-        result = await asyncio.to_thread(
-            ai_client.models.generate_images,
-            model="gemini-3.1-flash-image",
-            prompt=prompt,
-            config=dict(
-                number_of_images=1,
-                aspect_ratio="1:1",
-                output_mime_type="image/jpeg",
-            ),
-        )
+    # Endpoint REST chuẩn của Imagen 3 trên Google AI Studio
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key={GEMINI_API_KEY}"
 
-        # Lấy dữ liệu bytes của ảnh
-        image_bytes = result.generated_images[0].image.image_bytes
+    headers = {"Content-Type": "application/json"}
+
+    payload = {
+        "instances": [{"prompt": prompt}],
+        "parameters": {
+            "sampleCount": 1,
+            "aspectRatio": "1:1",
+            "outputOptions": {"mimeType": "image/jpeg"},
+        },
+    }
+
+    try:
+        # Gọi REST API bất đồng bộ với timeout 25s
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            res_data = response.json()
+
+        # Kiểm tra nếu Google trả về mã lỗi HTTP
+        if response.status_code != 200:
+            error_message = res_data.get("error", {}).get(
+                "message", response.text
+            )
+
+            if "billed" in error_message.lower() or response.status_code == 403:
+                await status_msg.edit_text(
+                    "❌ **Yêu cầu Billing:** Imagen 3 trên Google AI Studio yêu cầu tài khoản/project Google Cloud phải bật thanh toán Pay-as-you-go (không hỗ trợ Free tier hoàn toàn)."
+                )
+            elif response.status_code == 429:
+                await status_msg.edit_text(
+                    "❌ Hết hạn ngạch (Rate Limit). Vui lòng thử lại sau 1 phút."
+                )
+            else:
+                await status_msg.edit_text(
+                    f"❌ Lỗi từ Google ({response.status_code}):\n`{error_message[:200]}`"
+                )
+            return
+
+        # Trích xuất dữ liệu ảnh Base64 từ kết quả trả về
+        predictions = res_data.get("predictions", [])
+        if not predictions or "bytesBase64Encoded" not in predictions[0]:
+            await status_msg.edit_text("❌ Không nhận được dữ liệu ảnh trả về.")
+            return
+
+        image_base64 = predictions[0]["bytesBase64Encoded"]
+        image_bytes = base64.b64decode(image_base64)
+
+        # Chuyển thành stream để gửi qua Telegram
         photo_stream = io.BytesIO(image_bytes)
         photo_stream.name = "generated.jpg"
 
-        # Gửi ảnh về Telegram
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=photo_stream,
@@ -101,25 +137,13 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await status_msg.delete()
 
+    except httpx.TimeoutException:
+        await status_msg.edit_text(
+            "⏳ Quá thời gian chờ (Timeout) khi tạo ảnh. Vui lòng thử lại!"
+        )
     except Exception as e:
         logger.error(f"Lỗi tạo ảnh: {e}")
-        err_msg = str(e)
-
-        # Bắt các trường hợp lỗi thường gặp của AI Studio
-        if (
-            "403" in err_msg
-            or "PERMISSION_DENIED" in err_msg
-            or "billed" in err_msg.lower()
-        ):
-            await status_msg.edit_text(
-                "❌ **Lỗi phân quyền:** Mô hình Imagen 3 trên Google AI Studio yêu cầu dự án phải liên kết thẻ thanh toán (Billing/Pay-as-you-go). Tài khoản Free Tier hiện chưa hỗ trợ gọi trực tiếp Imagen 3 qua API."
-            )
-        elif "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            await status_msg.edit_text(
-                "❌ Hết hạn ngạch tạm thời (Rate Limit). Vui lòng thử lại sau 1 phút."
-            )
-        else:
-            await status_msg.edit_text(f"❌ Chi tiết lỗi:\n`{err_msg[:250]}`")
+        await status_msg.edit_text(f"❌ Đã xảy ra lỗi: `{str(e)[:200]}`")
 
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
