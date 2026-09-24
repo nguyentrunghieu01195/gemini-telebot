@@ -77,7 +77,7 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Endpoint REST chuẩn của Imagen 3 trên Google AI Studio
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:predict?key={GEMINI_API_KEY}"
 
     headers = {"Content-Type": "application/json"}
 
