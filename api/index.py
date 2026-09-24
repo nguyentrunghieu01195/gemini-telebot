@@ -62,7 +62,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: `/img cute cat in cyberpunk city, 4k`",
+            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: `/img cute cat in cyberpunk city, digital art`",
             parse_mode="Markdown",
         )
         return
@@ -70,64 +70,72 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(context.args)
 
     status_msg = await update.message.reply_text(
-        "🎨 Đang vẽ ảnh với Imagen 3, vui lòng đợi..."
+        "🎨 Đang vẽ ảnh, vui lòng đợi..."
     )
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO
     )
 
-    # Endpoint REST chuẩn của Imagen 3 trên Google AI Studio
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:predict?key={GEMINI_API_KEY}"
+    # Sử dụng endpoint :generateContent với mô hình hỗ trợ sinh ảnh qua Developer API
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}"
 
     headers = {"Content-Type": "application/json"}
 
+    # Payload chuẩn của :generateContent yêu cầu sinh ảnh
     payload = {
-        "instances": [{"prompt": prompt}],
-        "parameters": {
-            "sampleCount": 1,
-            "aspectRatio": "1:1",
-            "outputOptions": {"mimeType": "image/jpeg"},
-        },
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": f"Generate a high quality visual image of: {prompt}"
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
     }
 
     try:
-        # Gọi REST API bất đồng bộ với timeout 25s
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, json=payload, headers=headers)
             res_data = response.json()
 
-        # Kiểm tra nếu Google trả về mã lỗi HTTP
         if response.status_code != 200:
             error_message = res_data.get("error", {}).get(
                 "message", response.text
             )
-
-            if "billed" in error_message.lower() or response.status_code == 403:
-                await status_msg.edit_text(
-                    "❌ **Yêu cầu Billing:** Imagen 3 trên Google AI Studio yêu cầu tài khoản/project Google Cloud phải bật thanh toán Pay-as-you-go (không hỗ trợ Free tier hoàn toàn)."
-                )
-            elif response.status_code == 429:
-                await status_msg.edit_text(
-                    "❌ Hết hạn ngạch (Rate Limit). Vui lòng thử lại sau 1 phút."
-                )
-            else:
-                await status_msg.edit_text(
-                    f"❌ Lỗi từ Google ({response.status_code}):\n`{error_message[:200]}`"
-                )
+            await status_msg.edit_text(
+                f"❌ Lỗi từ Google ({response.status_code}):\n`{error_message[:250]}`"
+            )
             return
 
-        # Trích xuất dữ liệu ảnh Base64 từ kết quả trả về
-        predictions = res_data.get("predictions", [])
-        if not predictions or "bytesBase64Encoded" not in predictions[0]:
-            await status_msg.edit_text("❌ Không nhận được dữ liệu ảnh trả về.")
+        # Tìm phần dữ liệu ảnh trong các candidates trả về
+        candidates = res_data.get("candidates", [])
+        image_bytes = None
+
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            for part in parts:
+                inline_data = part.get("inlineData") or part.get("inline_data")
+                if inline_data and "data" in inline_data:
+                    image_bytes = base64.b64decode(inline_data["data"])
+                    break
+
+        if not image_bytes:
+            # Nếu model trả về text từ chối hoặc không sinh được ảnh
+            fallback_text = (
+                parts[0].get("text", "")
+                if candidates and parts
+                else "Không có dữ liệu ảnh trả về."
+            )
+            await status_msg.edit_text(
+                f"⚠️ Không nhận được ảnh. Phản hồi từ AI: {fallback_text[:200]}"
+            )
             return
 
-        image_base64 = predictions[0]["bytesBase64Encoded"]
-        image_bytes = base64.b64decode(image_base64)
-
-        # Chuyển thành stream để gửi qua Telegram
+        # Gửi ảnh về Telegram
         photo_stream = io.BytesIO(image_bytes)
-        photo_stream.name = "generated.jpg"
+        photo_stream.name = "output.jpg"
 
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
@@ -138,9 +146,7 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.delete()
 
     except httpx.TimeoutException:
-        await status_msg.edit_text(
-            "⏳ Quá thời gian chờ (Timeout) khi tạo ảnh. Vui lòng thử lại!"
-        )
+        await status_msg.edit_text("⏳ Quá thời gian chờ (Timeout) khi tạo ảnh.")
     except Exception as e:
         logger.error(f"Lỗi tạo ảnh: {e}")
         await status_msg.edit_text(f"❌ Đã xảy ra lỗi: `{str(e)[:200]}`")
