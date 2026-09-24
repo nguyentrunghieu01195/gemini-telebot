@@ -58,51 +58,81 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1. Kiểm tra xem người dùng có nhập mô tả hay không
     if not context.args:
         await update.message.reply_text(
-            "Cú pháp: `/img <mô tả>`\nVí dụ: `/img cyberpunk cat in neo hanoi`",
+            "⚠️ Vui lòng nhập mô tả sau lệnh `/img`.\nVí dụ: `/img a cute orange cat in space`",
             parse_mode="Markdown",
         )
         return
 
-    raw_prompt = " ".join(context.args)
+    prompt = " ".join(context.args)
+
+    # 2. Phản hồi ngay lập tức để người dùng biết bot đã nhận lệnh
     status_msg = await update.message.reply_text(
-        "🎨 Đang vẽ ảnh, vui lòng đợi vài giây..."
+        "🎨 Đang xử lý vẽ ảnh, vui lòng đợi..."
     )
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO
     )
 
     try:
-        refined_prompt = await translate_prompt_to_en(raw_prompt)
+        image_bytes = None
 
-        # Gọi Imagen 3
-        result = await asyncio.to_thread(
-            ai_client.models.generate_images,
-            model="imagen-3.0-generate-002",
-            prompt=refined_prompt,
-            config=dict(
-                number_of_images=1,
-                aspect_ratio="1:1",
-                output_mime_type="image/jpeg",
-            ),
-        )
+        # Cách 1: Sử dụng mô hình tạo ảnh trực tiếp của Gemini (Hỗ trợ tốt API Key thông thường)
+        try:
+            response = await asyncio.to_thread(
+                ai_client.models.generate_content,
+                model="gemini-2.5-flash-image",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                ),
+            )
+            # Trích xuất dữ liệu ảnh dạng byte
+            for part in response.candidates[0].content.parts:
+                if part.inline_data:
+                    image_bytes = part.inline_data.data
+                    break
+        except Exception as e_nano:
+            logger.warning(
+                f"gemini-2.5-flash-image failed: {e_nano}, thử fallback sang Imagen..."
+            )
 
-        image_bytes = result.generated_images[0].image.image_bytes
+        # Cách 2: Fallback sang Imagen 3 nếu cách 1 không trả về ảnh
+        if not image_bytes:
+            result = await asyncio.to_thread(
+                ai_client.models.generate_images,
+                model="imagen-3.0-generate-002",
+                prompt=prompt,
+                config=dict(number_of_images=1, output_mime_type="image/jpeg"),
+            )
+            image_bytes = result.generated_images[0].image.image_bytes
+
+        # 3. Gửi ảnh về Telegram
         photo_stream = io.BytesIO(image_bytes)
         photo_stream.name = "output.jpg"
 
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=photo_stream,
-            caption=f"✨ **Prompt:** {raw_prompt}",
+            caption=f"✨ **Prompt:** {prompt}",
             parse_mode="Markdown",
         )
         await status_msg.delete()
 
     except Exception as e:
         logger.error(f"Lỗi tạo ảnh: {e}")
-        await status_msg.edit_text(f"❌ Không thể tạo ảnh: {str(e)[:150]}")
+        # Báo chi tiết lỗi ra khung chat để dễ debug
+        err_text = str(e)
+        if "403" in err_text or "PERMISSION_DENIED" in err_text:
+            msg = "❌ API Key này chưa được cấp quyền sinh ảnh (Imagen yêu cầu bật billing trên Google Cloud/AI Studio)."
+        elif "429" in err_text or "RESOURCE_EXHAUSTED" in err_text:
+            msg = "❌ Quá giới hạn request (Rate Limit). Vui lòng thử lại sau 1 phút."
+        else:
+            msg = f"❌ Lỗi: {err_text[:200]}"
+
+        await status_msg.edit_text(msg)
 
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
