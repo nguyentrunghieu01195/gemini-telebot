@@ -123,22 +123,57 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+    # Bỏ qua nếu không có tin nhắn văn bản
+    if not update.message or not update.message.text:
+        return
+
+    message = update.message
+    chat_type = message.chat.type  # 'private', 'group', hoặc 'supergroup'
+    user_text = message.text
+    bot_username = context.bot.username
+
+    # Xử lý logic theo môi trường:
+    is_private = chat_type == "private"
+    is_mentioned = bot_username and f"@{bot_username}" in user_text
+    is_reply_to_bot = (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == context.bot.id
+    )
+
+    # Nếu ở trong Group: Chỉ trả lời khi được tag HOẶC khi được reply
+    # (Nếu muốn bot trả lời TẤT CẢ mọi tin nhắn trong group, bạn chỉ cần bỏ điều kiện if này đi)
+    if not is_private and not (is_mentioned or is_reply_to_bot):
+        return
+
+    # Lọc bỏ chữ @tên_bot ra khỏi câu hỏi để Gemini không bị bối rối
+    if is_mentioned and bot_username:
+        user_text = user_text.replace(f"@{bot_username}", "").strip()
+
+    if not user_text:
+        await message.reply_text("Dạ, bạn cần mình hỗ trợ gì ạ?")
+        return
+
+    # Hiển thị trạng thái đang soạn tin nhắn
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        chat_id=message.chat_id, action=ChatAction.TYPING
     )
 
     try:
+        # Gọi Gemini
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
             model="gemini-2.5-flash",
             contents=user_text,
         )
         reply_content = response.text or "Không nhận được phản hồi."
-        await update.message.reply_text(reply_content)
+
+        # Trả lời dạng Reply vào chính tin nhắn của người hỏi trong nhóm
+        await message.reply_text(reply_content, reply_to_message_id=message.message_id)
+
     except Exception as e:
-        logger.error(f"Lỗi chat: {e}")
-        await update.message.reply_text("Có lỗi khi kết nối với Gemini.")
+        logger.error(f"Lỗi chat nhóm: {e}")
+        await message.reply_text("Có lỗi khi kết nối với AI, vui lòng thử lại sau!")
 
 
 # Khởi tạo App Bot ở chế độ không dùng polling
