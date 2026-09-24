@@ -5,6 +5,7 @@ import logging
 import os
 import base64
 import httpx
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from google import genai
 from telegram import Update
