@@ -8,6 +8,7 @@ import httpx
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -61,39 +62,80 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1. Kiểm tra tham số người dùng nhập
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập mô tả: `/img con mèo không gian`"
+            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: `/img một chú mèo cam phi hành gia trên sao hỏa`",
+            parse_mode="Markdown",
         )
         return
 
     prompt = " ".join(context.args)
-    status_msg = await update.message.reply_text("🎨 Đang vẽ ảnh...")
+
+    status_msg = await update.message.reply_text(
+        "🎨 Đang vẽ ảnh với Gemini, vui lòng đợi vài giây..."
+    )
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO
     )
 
     try:
-        # Mã hoá prompt cho URL
-        encoded_prompt = urllib.parse.quote(prompt)
-        image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+        # 2. Gọi mô hình Gemini tạo ảnh chính thức qua SDK
+        # Chạy trong asyncio.to_thread để không nghẽn event loop của Vercel Webhook
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model="gemini-2.5-flash-image",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE"],
+            ),
+        )
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            res = await client.get(image_url)
-            if res.status_code == 200:
-                photo_stream = io.BytesIO(res.content)
-                photo_stream.name = "image.jpg"
-                await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=photo_stream,
-                    caption=f"✨ **Prompt:** {prompt}",
-                    parse_mode="Markdown",
-                )
-                await status_msg.delete()
-            else:
-                await status_msg.edit_text("❌ Lỗi server vẽ ảnh.")
+        image_bytes = None
+
+        # 3. Trích xuất bytes ảnh từ candidates trả về
+        if response.candidates:
+            for part in response.candidates[0].content.parts:
+                # Với SDK google-genai, dữ liệu ảnh nằm trong inline_data.data
+                if getattr(part, "inline_data", None) and part.inline_data.data:
+                    image_bytes = part.inline_data.data
+                    break
+
+        if not image_bytes:
+            # Trường hợp an toàn (Safety filter chặn hoặc prompt bị từ chối)
+            refusal = (
+                response.text
+                if hasattr(response, "text") and response.text
+                else "Prompt vi phạm chính sách an toàn hoặc không thể tạo ảnh."
+            )
+            await status_msg.edit_text(f"⚠️ Không nhận được ảnh: {refusal}")
+            return
+
+        # 4. Gửi ảnh trực tiếp về Telegram
+        photo_stream = io.BytesIO(image_bytes)
+        photo_stream.name = "gemini_generated.jpg"
+
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=photo_stream,
+            caption=f"✨ **Prompt:** {prompt}",
+            parse_mode="Markdown",
+        )
+        await status_msg.delete()
+
     except Exception as e:
-        await status_msg.edit_text(f"❌ Lỗi: {str(e)[:150]}")
+        logger.error(f"Lỗi tạo ảnh Gemini: {e}")
+        err_msg = str(e)
+        if "403" in err_msg or "PERMISSION_DENIED" in err_msg:
+            await status_msg.edit_text(
+                "❌ **Lỗi quyền hạn (403):** API Key chưa được kích hoạt quyền tạo ảnh hoặc project cần liên kết phương thức thanh toán trên Google AI Studio."
+            )
+        elif "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            await status_msg.edit_text(
+                "❌ Đã chạm giới hạn lượt gọi (Rate Limit), vui lòng thử lại sau 1 phút."
+            )
+        else:
+            await status_msg.edit_text(f"❌ Chi tiết lỗi:\n`{err_msg[:250]}`")
 
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
