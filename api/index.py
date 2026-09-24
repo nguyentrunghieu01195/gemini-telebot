@@ -78,7 +78,7 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Gọi chính xác API của Imagen 3 dành cho Google AI Studio
         result = await asyncio.to_thread(
             ai_client.models.generate_images,
-            model="imagen-3.0-generate-002",
+            model="gemini-3.1-flash-image",
             prompt=prompt,
             config=dict(
                 number_of_images=1,
