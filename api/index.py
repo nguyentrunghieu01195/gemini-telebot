@@ -21,6 +21,7 @@ from telegram.ext import (
     filters,
 )
 
+from api.conversation import ConversationMemory
 from api.utils import split_telegram_text
 
 # Thiết lập log cơ bản
@@ -52,6 +53,7 @@ _processed_update_ids: set[int] = set()
 _processed_update_order: deque[int] = deque()
 _processed_update_lock = threading.Lock()
 _MAX_TRACKED_UPDATES = 2_000
+conversation_memory = ConversationMemory(max_messages=16, max_characters=24_000)
 
 
 def remember_update(update_id: int) -> bool:
@@ -83,6 +85,14 @@ async def reply_long_text(message, text: str) -> None:
         await message.reply_text(chunk, **kwargs)
 
 
+def conversation_key(update: Update) -> tuple[int, int]:
+    """Keep histories separate for each private chat or group topic."""
+    chat_id = update.effective_chat.id
+    message = update.effective_message
+    thread_id = message.message_thread_id if message else None
+    return chat_id, thread_id or 0
+
+
 # --- Handlers Telegram ---
 
 
@@ -93,9 +103,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Bot AI Vercel Serverless:\n"
         "• Nhắn tin bất kỳ: Trò chuyện thông minh cùng Gemini.\n"
         "• Lệnh /img <mô tả>: Sinh ảnh bằng Gemini.\n\n"
+        "• Lệnh /reset: Xóa ngữ cảnh hội thoại hiện tại.\n\n"
         "Lưu ý: Tạo ảnh có thể mất nhiều thời gian hơn trò chuyện."
     )
     await update.message.reply_text(welcome_text)
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conversation_memory.clear(conversation_key(update))
+    await update.message.reply_text("🧹 Mình đã xóa ngữ cảnh hội thoại hiện tại.")
 
 
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,13 +227,19 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # Gọi Gemini
+        # Gửi lịch sử gần nhất cùng câu hỏi mới để Gemini giữ được ngữ cảnh.
+        key = conversation_key(update)
+        contents = conversation_memory.get(key)
+        contents.append({"role": "user", "parts": [{"text": user_text}]})
         response = await asyncio.to_thread(
             ai_client.models.generate_content,
             model="gemini-2.5-flash",
-            contents=user_text,
+            contents=contents,
         )
         reply_content = response.text or "Không nhận được phản hồi."
+
+        # Chỉ ghi lại một lượt hoàn chỉnh sau khi Gemini trả lời thành công.
+        conversation_memory.add_exchange(key, user_text, reply_content)
 
         # Trả lời dạng Reply vào chính tin nhắn của người hỏi trong nhóm
         await reply_long_text(message, reply_content)
@@ -230,6 +252,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Khởi tạo App Bot ở chế độ không dùng polling
 bot_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).updater(None).build()
 bot_app.add_handler(CommandHandler("start", cmd_start))
+bot_app.add_handler(CommandHandler(["reset", "new"], cmd_reset))
 bot_app.add_handler(CommandHandler(["img", "image"], cmd_img))
 bot_app.add_handler(
     MessageHandler(filters.TEXT & (~filters.COMMAND), handle_chat)

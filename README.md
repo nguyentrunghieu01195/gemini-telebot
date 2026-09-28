@@ -1,7 +1,10 @@
 # Telegram Gemini Bot
 
-Telegram bot chạy dưới dạng Vercel Python Function. Bot hỗ trợ trò chuyện với
-Gemini trong tin nhắn riêng/nhóm và tạo ảnh bằng lệnh `/img`.
+Telegram bot chạy dưới dạng Vercel Python Function. Bot hỗ trợ trò chuyện có
+ngữ cảnh với Gemini trong tin nhắn riêng/nhóm và tạo ảnh bằng lệnh `/img`.
+
+Bot giữ tối đa 16 tin nhắn gần nhất (8 lượt hỏi/đáp) cho từng chat hoặc từng
+topic trong group. Dùng `/reset` hoặc `/new` để xóa ngữ cảnh hiện tại.
 
 ## Cấu hình
 
@@ -47,6 +50,8 @@ python -m py_compile api/index.py local_test.py
 
 Việc ghi nhớ `update_id` hiện nằm trong bộ nhớ của từng serverless instance. Nó
 ngăn retry trùng trên cùng instance nhưng không bảo đảm idempotency giữa nhiều
-instance. Tạo ảnh cũng diễn ra ngay trong request webhook và có thể vượt timeout
-của gói hosting. Nếu bot có lưu lượng thực tế, nên đưa tác vụ Gemini vào queue,
-lưu `update_id` trong Redis/database và để worker gửi kết quả về Telegram.
+instance. Lịch sử trò chuyện cũng đang nằm trong bộ nhớ này, vì vậy có thể mất
+khi Vercel cold start hoặc request được chuyển sang instance khác. Tạo ảnh cũng
+diễn ra ngay trong request webhook và có thể vượt timeout của gói hosting. Nếu
+bot có lưu lượng thực tế, nên lưu cả lịch sử và `update_id` trong Redis/database,
+đưa tác vụ Gemini vào queue rồi để worker gửi kết quả về Telegram.
