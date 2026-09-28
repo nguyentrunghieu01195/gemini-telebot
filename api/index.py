@@ -1,12 +1,14 @@
 import asyncio
+import hmac
 import io
 import json
 import logging
 import os
-import base64
-import httpx
-import urllib.parse
+import re
+import threading
+from collections import deque
 from http.server import BaseHTTPRequestHandler
+
 from google import genai
 from google.genai import types
 from telegram import Update
@@ -19,54 +21,88 @@ from telegram.ext import (
     filters,
 )
 
+from api.utils import split_telegram_text
+
 # Thiết lập log cơ bản
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Đọc token từ Environment Variables cấu hình trên Vercel
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+def required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+TELEGRAM_BOT_TOKEN = required_env("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = required_env("GEMINI_API_KEY")
+WEBHOOK_SECRET_TOKEN = required_env("WEBHOOK_SECRET_TOKEN")
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", WEBHOOK_SECRET_TOKEN):
+    raise RuntimeError(
+        "WEBHOOK_SECRET_TOKEN must be 1-256 characters using A-Z, a-z, 0-9, _ or -"
+    )
 
 # Khởi tạo Gemini Client
-ai_client = (
-    genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Giảm việc xử lý lại khi Telegram retry trong cùng một serverless instance.
+# Đây không thay thế một idempotency store dùng chung giữa nhiều instance.
+_processed_update_ids: set[int] = set()
+_processed_update_order: deque[int] = deque()
+_processed_update_lock = threading.Lock()
+_MAX_TRACKED_UPDATES = 2_000
 
 
-async def translate_prompt_to_en(prompt: str) -> str:
-    """Tối ưu prompt sang tiếng Anh giúp Imagen tạo ảnh chuẩn hơn."""
-    try:
-        res = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model="gemini-2.5-flash",
-            contents=f"Translate and enhance this visual prompt to descriptive English for image generation. Return only the prompt, no intro: '{prompt}'",
-        )
-        return res.text.strip()
-    except Exception:
-        return prompt
+def remember_update(update_id: int) -> bool:
+    """Return False when an update has already been seen in this instance."""
+    with _processed_update_lock:
+        if update_id in _processed_update_ids:
+            return False
+        _processed_update_ids.add(update_id)
+        _processed_update_order.append(update_id)
+        if len(_processed_update_order) > _MAX_TRACKED_UPDATES:
+            oldest = _processed_update_order.popleft()
+            _processed_update_ids.discard(oldest)
+        return True
+
+
+def forget_update(update_id: int) -> None:
+    """Allow Telegram to retry an update that failed during processing."""
+    with _processed_update_lock:
+        _processed_update_ids.discard(update_id)
+        try:
+            _processed_update_order.remove(update_id)
+        except ValueError:
+            pass
+
+
+async def reply_long_text(message, text: str) -> None:
+    for index, chunk in enumerate(split_telegram_text(text)):
+        kwargs = {"reply_to_message_id": message.message_id} if index == 0 else {}
+        await message.reply_text(chunk, **kwargs)
 
 
 # --- Handlers Telegram ---
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
+    user_name = update.effective_user.first_name if update.effective_user else "bạn"
     welcome_text = (
         f"Xin chào {user_name}!\n\n"
-        "🤖 **Bot AI Vercel Serverless:**\n"
+        "🤖 Bot AI Vercel Serverless:\n"
         "• Nhắn tin bất kỳ: Trò chuyện thông minh cùng Gemini.\n"
-        "• Lệnh `/img <mô tả>`: Sinh ảnh nghệ thuật bằng Imagen 3.\n\n"
-        "_Lưu ý: Do chạy trên Vercel Serverless (Timeout 15s), tính năng tạo video Veo không thể thực hiện qua Webhook này._"
+        "• Lệnh /img <mô tả>: Sinh ảnh bằng Gemini.\n\n"
+        "Lưu ý: Tạo ảnh có thể mất nhiều thời gian hơn trò chuyện."
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome_text)
 
 
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1. Kiểm tra tham số người dùng nhập
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: `/img một chú mèo cam phi hành gia trên sao hỏa`",
-            parse_mode="Markdown",
+            "⚠️ Vui lòng nhập mô tả ảnh!\nVí dụ: /img một chú mèo cam phi hành gia trên sao hỏa",
         )
         return
 
@@ -94,8 +130,8 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_bytes = None
 
         # 3. Trích xuất bytes ảnh từ candidates trả về
-        if response.candidates:
-            for part in response.candidates[0].content.parts:
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts or []:
                 # Với SDK google-genai, dữ liệu ảnh nằm trong inline_data.data
                 if getattr(part, "inline_data", None) and part.inline_data.data:
                     image_bytes = part.inline_data.data
@@ -118,24 +154,23 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=photo_stream,
-            caption=f"✨ **Prompt:** {prompt}",
-            parse_mode="Markdown",
+            caption=f"✨ Prompt: {prompt}"[:1024],
         )
         await status_msg.delete()
 
     except Exception as e:
-        logger.error(f"Lỗi tạo ảnh Gemini: {e}")
+        logger.exception("Lỗi tạo ảnh Gemini")
         err_msg = str(e)
         if "403" in err_msg or "PERMISSION_DENIED" in err_msg:
             await status_msg.edit_text(
-                "❌ **Lỗi quyền hạn (403):** API Key chưa được kích hoạt quyền tạo ảnh hoặc project cần liên kết phương thức thanh toán trên Google AI Studio."
+                "❌ Lỗi quyền hạn (403): API Key chưa được kích hoạt quyền tạo ảnh hoặc project cần liên kết phương thức thanh toán trên Google AI Studio."
             )
         elif "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
             await status_msg.edit_text(
                 "❌ Đã chạm giới hạn lượt gọi (Rate Limit), vui lòng thử lại sau 1 phút."
             )
         else:
-            await status_msg.edit_text(f"❌ Chi tiết lỗi:\n`{err_msg[:250]}`")
+            await status_msg.edit_text(f"❌ Không thể tạo ảnh: {err_msg[:250]}")
 
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,10 +220,10 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_content = response.text or "Không nhận được phản hồi."
 
         # Trả lời dạng Reply vào chính tin nhắn của người hỏi trong nhóm
-        await message.reply_text(reply_content, reply_to_message_id=message.message_id)
+        await reply_long_text(message, reply_content)
 
-    except Exception as e:
-        logger.error(f"Lỗi chat nhóm: {e}")
+    except Exception:
+        logger.exception("Lỗi xử lý chat")
         await message.reply_text("Có lỗi khi kết nối với AI, vui lòng thử lại sau!")
 
 
@@ -204,11 +239,35 @@ bot_app.add_handler(
 # --- HTTP Entrypoint cho Vercel ---
 class handler(BaseHTTPRequestHandler):
 
+    def send_text(self, status: int, body: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
     def do_POST(self):
+        supplied_secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(supplied_secret, WEBHOOK_SECRET_TOKEN):
+            self.send_text(403, "Forbidden")
+            return
+
+        update_id = None
+        loop = None
         try:
             content_length = int(self.headers.get("Content-Length", 0))
+            if content_length <= 0 or content_length > 1_000_000:
+                self.send_text(400, "Invalid request size")
+                return
             raw_body = self.rfile.read(content_length)
             payload = json.loads(raw_body.decode("utf-8"))
+
+            update_id = payload.get("update_id")
+            if not isinstance(update_id, int):
+                self.send_text(400, "Missing update_id")
+                return
+            if not remember_update(update_id):
+                self.send_text(200, "Already processed")
+                return
 
             update = Update.de_json(payload, bot_app.bot)
 
@@ -216,17 +275,21 @@ class handler(BaseHTTPRequestHandler):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self.process(update))
-            loop.close()
 
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-        except Exception as e:
-            logger.error(f"Error handling POST: {e}")
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(str(e).encode("utf-8"))
+            self.send_text(200, "OK")
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            if update_id is not None:
+                forget_update(update_id)
+            logger.exception("Invalid webhook request")
+            self.send_text(400, "Invalid request")
+        except Exception:
+            if update_id is not None:
+                forget_update(update_id)
+            logger.exception("Error handling webhook")
+            self.send_text(500, "Internal server error")
+        finally:
+            if loop is not None:
+                loop.close()
 
     async def process(self, update: Update):
         async with bot_app:
@@ -234,11 +297,4 @@ class handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # Trả về trang test khi mở URL Vercel trên trình duyệt
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(
-            "Telegram Gemini Bot Webhook đang chạy bình thường trên Vercel!".encode(
-                "utf-8"
-            )
-        )
+        self.send_text(200, "Telegram Gemini Bot webhook is available.")
